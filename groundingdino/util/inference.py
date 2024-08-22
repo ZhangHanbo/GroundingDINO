@@ -7,6 +7,7 @@ import torch
 from PIL import Image
 from torchvision.ops import box_convert
 import bisect
+from typing import Optional, Union
 
 import groundingdino.datasets.transforms as T
 from groundingdino.models import build_model
@@ -57,7 +58,8 @@ def predict(
         box_threshold: float,
         text_threshold: float,
         device: str = "cuda",
-        remove_combined: bool = False
+        remove_combined: bool = False,
+        no_post_process: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
     caption = preprocess_caption(caption=caption)
 
@@ -77,27 +79,42 @@ def predict(
     tokenizer = model.tokenizer
     tokenized = tokenizer(caption)
     
-    if remove_combined:
+    if no_post_process:
         sep_idx = [i for i in range(len(tokenized['input_ids'])) if tokenized['input_ids'][i] in [101, 102, 1012]]
-        
+
         phrases = []
+        word_logits = []
         for logit in logits:
             max_idx = logit.argmax()
             insert_idx = bisect.bisect_left(sep_idx, max_idx)
             right_idx = sep_idx[insert_idx]
             left_idx = sep_idx[insert_idx - 1]
-            phrases.append(get_phrases_from_posmap(logit > text_threshold, tokenized, tokenizer, left_idx, right_idx).replace('.', ''))
+            logit = logit[left_idx:right_idx]
+            word_logits.append(logit)
+        return boxes, word_logits, [caption for _ in range(len(word_logits))]
+
     else:
-        phrases = [
-            get_phrases_from_posmap(logit > text_threshold, tokenized, tokenizer).replace('.', '')
-            for logit
-            in logits
-        ]
+        if remove_combined:
+            sep_idx = [i for i in range(len(tokenized['input_ids'])) if tokenized['input_ids'][i] in [101, 102, 1012]]
+            
+            phrases = []
+            for logit in logits:
+                max_idx = logit.argmax()
+                insert_idx = bisect.bisect_left(sep_idx, max_idx)
+                right_idx = sep_idx[insert_idx]
+                left_idx = sep_idx[insert_idx - 1]
+                phrases.append(get_phrases_from_posmap(logit > text_threshold, tokenized, tokenizer, left_idx, right_idx).replace('.', ''))
+        else:
+            phrases = [
+                get_phrases_from_posmap(logit > text_threshold, tokenized, tokenizer).replace('.', '')
+                for logit
+                in logits
+            ]
 
-    return boxes, logits.max(dim=1)[0], phrases
+        return boxes, logits.max(dim=1)[0], phrases
 
 
-def annotate(image_source: np.ndarray, boxes: torch.Tensor, logits: torch.Tensor, phrases: List[str]) -> np.ndarray:
+def annotate(image_source: np.ndarray, boxes: torch.Tensor, logits: Optional[torch.Tensor], phrases: Optional[List[str]]) -> np.ndarray:
     """    
     This function annotates an image with bounding boxes and labels.
 
@@ -115,11 +132,17 @@ def annotate(image_source: np.ndarray, boxes: torch.Tensor, logits: torch.Tensor
     xyxy = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
     detections = sv.Detections(xyxy=xyxy)
 
-    labels = [
-        f"{phrase} {logit:.2f}"
-        for phrase, logit
-        in zip(phrases, logits)
-    ]
+    if phrases is None:
+        phrases = ["target" for _ in range(len(boxes))]
+    
+    if logits is not None:
+        labels = [
+            f"{phrase} {logit:.2f}"
+            for phrase, logit
+            in zip(phrases, logits)
+        ]
+    else:
+        labels = phrases
 
     bbox_annotator = sv.BoxAnnotator(color_lookup=sv.ColorLookup.INDEX)
     label_annotator = sv.LabelAnnotator(color_lookup=sv.ColorLookup.INDEX)
